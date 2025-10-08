@@ -10,12 +10,20 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time" // Diimpor untuk timeout
 
 	"google.golang.org/api/option"
 	"google.golang.org/api/sheets/v4"
 )
 
-// ======================= Struct =======================
+// ======================= Globals & Structs =======================
+
+// OPTIMASI: Definisikan HTTP client secara global dengan timeout.
+// Ini mencegah aplikasi "menggantung" jika API eksternal lambat.
+var apiClient = &http.Client{
+	Timeout: 30 * time.Second,
+}
+
 type ForecastRequest struct {
 	SpreadsheetID      string   `json:"spreadsheetId"`
 	SheetName          string   `json:"sheetName"`
@@ -33,13 +41,14 @@ type GeminiResponse struct {
 	} `json:"candidates"`
 }
 
-// ======================= Utility =======================
-func getSheetsService() (*sheets.Service, error) {
+// ======================= Utility Functions =======================
+
+func getSheetsService(ctx context.Context) (*sheets.Service, error) {
 	credsJSON := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 	if credsJSON == "" {
-		return nil, fmt.Errorf("GOOGLE_APPLICATION_CREDENTIALS_JSON not set")
+		return nil, fmt.Errorf("env variable GOOGLE_APPLICATION_CREDENTIALS_JSON not set")
 	}
-	ctx := context.Background()
+	// Menggunakan context dari handler untuk API call
 	return sheets.NewService(ctx, option.WithCredentialsJSON([]byte(credsJSON)))
 }
 
@@ -80,47 +89,33 @@ func mustJSON(v interface{}) string {
 	return string(b)
 }
 
-// ======================= Gemini Forecast =======================
+// ======================= Gemini Forecast Function =======================
+
 func callGeminiForecast(
+	ctx context.Context, // Menerima context untuk timeout
 	pastTotals map[string]map[string]float64,
 	lastYearProfile map[string][]float64,
 	cogs2026Total, dinDec2026 float64,
 ) (map[string]map[string]float64, error) {
 
-	models := []string{"gemini-2.5-pro", "gemini-2.5-flash"}
+	models := []string{"gemini-1.5-flash-latest", "gemini-1.5-pro-latest"} // Flash dulu, lebih cepat
 
-	prompt := fmt.Sprintf(`You are a financial forecasting AI.
+	prompt := fmt.Sprintf(`You are an efficient financial forecasting AI.
 
 Given:
-1) Per-remark yearly totals for 2024 and 2025 (K-EUR).
-2) 2025 monthly share profile per remark (12 numbers summing ≈ 1.0).
-3) Known total COGS for 2026 (K-EUR) = %.2f.
-4) Known "TOTAL DIN Yearly" December 2026 (K-EUR) = %.2f (this cell must remain untouched; you only forecast Jan-Nov).
+1) 2024 & 2025 yearly totals (K-EUR): %s
+2) 2025 monthly seasonality profile: %s
+3) Known total COGS for 2026 (K-EUR): %.2f
+4) Known "TOTAL DIN Yearly" for Dec 2026 (K-EUR): %.2f. This is a hard constraint. The sum of the 12 monthly "TOTAL NIN Spot" values must equal this number.
 
 Task:
-- Forecast Jan-Nov 2026 for each remark (K-EUR), following trend from 2024->2025 and 2025 monthly profile as prior for seasonality.
-- Keep values smooth and non-negative. Avoid unrealistic spikes.
-- Keep proportions versus COGS roughly consistent with past years (soft constraint).
-- Return STRICT JSON only (no Markdown fences).
-- JSON structure:
-{
-  "GIN (K-EUR)": {"Jan": n, "Feb": n, ..., "Nov": n},
-  "GIT (K-EUR)": {...},
-  "RM (K-EUR)": {...},
-  "WIP (K-EUR)": {...},
-  "FG (K-EUR)": {...},
-  "DEP (K-EUR)": {...},
-  "NIN TOTAL": {...},          
-  "TOTAL NIN Spot": {...},     
-  "TOTAL DIN Yearly": {...}    
-}
-
-Yearly totals (K-EUR):
-%s
-
-2025 monthly share profile (12 numbers each remark, sum ≈ 1.0):
-%s
-`, cogs2026Total, dinDec2026, mustJSON(pastTotals), mustJSON(lastYearProfile))
+- Forecast Jan-Dec 2026 for all remarks based on trends and seasonality.
+- Calculate "TOTAL NIN Spot" for all 12 months, then scale them proportionally so their sum exactly equals %.2f.
+- Calculate "TOTAL DIN Yearly" as the correct cumulative sum of the scaled "TOTAL NIN Spot".
+- Values must be non-negative and smooth.
+- Return STRICT JSON only (no markdown).
+- JSON structure: {"GIN (K-EUR)": {"Jan": n, ..., "Dec": n}, ...}
+`, mustJSON(pastTotals), mustJSON(lastYearProfile), cogs2026Total, dinDec2026, dinDec2026)
 
 	bodyReq := map[string]interface{}{
 		"contents": []map[string]interface{}{
@@ -131,31 +126,37 @@ Yearly totals (K-EUR):
 
 	var lastErr error
 	for _, model := range models {
-		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", model)
-		req, _ := http.NewRequest("POST", url, bytes.NewBuffer(body))
+		req, err := http.NewRequestWithContext(ctx, "POST",
+			fmt.Sprintf("[https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent](https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent)", model),
+			bytes.NewBuffer(body),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request for model %s: %w", model, err)
+		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-goog-api-key", os.Getenv("GEMINI_API_KEY"))
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := apiClient.Do(req)
 		if err != nil {
-			lastErr = fmt.Errorf("%s request failed: %v", model, err)
+			lastErr = fmt.Errorf("%s request failed: %w", model, err)
+			log.Printf("⚠️ Model %s failed: %v. Trying next...", model, err)
 			continue
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 400 {
-			lastErr = fmt.Errorf("%s API returned %d", model, resp.StatusCode)
-			log.Printf("⚠️ %s failed (%d), trying fallback...", model, resp.StatusCode)
+			lastErr = fmt.Errorf("%s API returned status %d", model, resp.StatusCode)
+			log.Printf("⚠️ Model %s returned status %d. Trying next...", model, resp.StatusCode)
 			continue
 		}
 
 		var result GeminiResponse
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			lastErr = fmt.Errorf("%s decode failed: %v", model, err)
+			lastErr = fmt.Errorf("%s decode failed: %w", model, err)
 			continue
 		}
 		if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
-			lastErr = fmt.Errorf("%s no candidates", model)
+			lastErr = fmt.Errorf("%s returned no candidates", model)
 			continue
 		}
 
@@ -163,55 +164,57 @@ Yearly totals (K-EUR):
 		out := map[string]map[string]float64{}
 		if err := json.Unmarshal([]byte(text), &out); err != nil {
 			log.Println("⚠️ Gemini raw output:", text)
-			lastErr = fmt.Errorf("%s invalid JSON: %v", model, err)
+			lastErr = fmt.Errorf("%s returned invalid JSON: %w", model, err)
 			continue
 		}
 
-		log.Printf("✅ Forecast generated with %s", model)
+		log.Printf("✅ Forecast generated successfully with %s", model)
 		return out, nil
 	}
-	return nil, fmt.Errorf("Gemini failed: %v", lastErr)
+	return nil, fmt.Errorf("all Gemini models failed: %w", lastErr)
 }
 
-// ======================= Forecast Handler =======================
+// ======================= Main Forecast Handler =======================
+
 func forecastHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
 		return
 	}
 
-	var req ForecastRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	var reqData ForecastRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil {
+		http.Error(w, "Bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	srv, err := getSheetsService()
+	srv, err := getSheetsService(ctx)
 	if err != nil {
-		http.Error(w, "Sheets API failed: "+err.Error(), 500)
+		http.Error(w, "Sheets API init failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	readRange := fmt.Sprintf("%s!B54:AM62", req.SheetName)
-	resp, err := srv.Spreadsheets.Values.Get(req.SpreadsheetID, readRange).Do()
+	log.Println("Step 1: Reading data from Google Sheets...")
+	readRange := fmt.Sprintf("%s!B54:AM63", reqData.SheetName)
+	resp, err := srv.Spreadsheets.Values.Get(reqData.SpreadsheetID, readRange).Do()
 	if err != nil {
-		http.Error(w, "Failed read: "+err.Error(), 500)
+		http.Error(w, "Failed to read from sheet: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	values := resp.Values
 	if len(values) == 0 {
-		http.Error(w, "No data found", 400)
+		http.Error(w, "No data found", http.StatusBadRequest)
 		return
 	}
 
+	log.Println("Step 2: Processing historical data...")
 	const (
-		colJan26   = 26 // AB
-		colNov26   = 36 // AL
-		colDec26   = 37 // AM
-		colStart24 = 2
-		colEnd24   = 13
-		colStart25 = 14
-		colEnd25   = 25
+		colJan26   = 26; colDec26   = 37
+		colStart24 = 2;  colEnd24   = 13
+		colStart25 = 14; colEnd25   = 25
 	)
 
 	pastTotals := map[string]map[string]float64{}
@@ -219,147 +222,92 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 	var cogs2026Total, dinDec2026 float64
 
 	for _, row := range values {
-		if len(row) < 2 {
-			continue
-		}
-		product := fmt.Sprintf("%v", row[0])
+		if len(row) < 2 { continue }
 		remark := fmt.Sprintf("%v", row[1])
+		for len(row) <= colDec26 { row = append(row, "") }
 
-		for len(row) <= colDec26 {
-			row = append(row, "")
-		}
-
-		var y2024 float64
-		tmp25 := make([]float64, 12)
-		sum25 := 0.0
-
-		for c := colStart24; c <= colEnd24; c++ {
-			y2024 += atof(row[c])
-		}
-		for i, c := 0, colStart25; c <= colEnd25; i, c = i+1, c+1 {
-			v := atof(row[c])
-			tmp25[i] = v
-			sum25 += v
-		}
-
+		var y2024, sum25 float64; tmp25 := make([]float64, 12)
+		for c := colStart24; c <= colEnd24; c++ { y2024 += atof(row[c]) }
+		for i, c := 0, colStart25; c <= colEnd25; i, c = i+1, c+1 { v := atof(row[c]); tmp25[i] = v; sum25 += v }
+		
 		prof25 := make([]float64, 12)
-		if sum25 > 0 {
-			for i := range prof25 {
-				prof25[i] = tmp25[i] / sum25
-			}
-		} else {
-			for i := range prof25 {
-				prof25[i] = 1.0 / 12.0
-			}
-		}
-
+		if sum25 > 0 { for i := range prof25 { prof25[i] = tmp25[i] / sum25 }
+		} else { for i := range prof25 { prof25[i] = 1.0 / 12.0 } }
+		
 		if remark != "" {
 			pastTotals[remark] = map[string]float64{"2024": round2(y2024), "2025": round2(sum25)}
 			lastYearProfile[remark] = prof25
 		}
-
-		if product == "TOTAL" && remark == "COGS (K-EUR)" && req.KnownCOGSTotal2026 == nil {
-			sum26 := 0.0
-			for c := colJan26; c <= colDec26 && c < len(row); c++ {
-				sum26 += atof(row[c])
-			}
-			cogs2026Total = round2(sum26)
+		
+		if remark == "COGS (K-EUR)" && reqData.KnownCOGSTotal2026 == nil {
+			for c := colJan26; c <= colDec26; c++ { cogs2026Total += atof(row[c]) }
+			cogs2026Total = round2(cogs2026Total)
 		}
-		if product == "TOTAL" && remark == "TOTAL DIN Yearly" && req.KnownDINDec2026 == nil && colDec26 < len(row) {
-			dinDec2026 = round2(atof(row[colDec26]))
-		}
+		if remark == "TOTAL DIN Yearly" && reqData.KnownDINDec2026 == nil { dinDec2026 = round2(atof(row[colDec26])) }
 	}
 
-	if req.KnownCOGSTotal2026 != nil {
-		cogs2026Total = *req.KnownCOGSTotal2026
-	}
-	if req.KnownDINDec2026 != nil {
-		dinDec2026 = *req.KnownDINDec2026
-	}
+	if reqData.KnownCOGSTotal2026 != nil { cogs2026Total = *reqData.KnownCOGSTotal2026 }
+	if reqData.KnownDINDec2026 != nil { dinDec2026 = *reqData.KnownDINDec2026 }
 
-	aiResult, err := callGeminiForecast(pastTotals, lastYearProfile, cogs2026Total, dinDec2026)
+	log.Println("Step 3: Calling Gemini AI for forecast...")
+	startTime := time.Now()
+	aiResult, err := callGeminiForecast(ctx, pastTotals, lastYearProfile, cogs2026Total, dinDec2026)
+	duration := time.Since(startTime)
 	if err != nil {
-		http.Error(w, "AI Forecast failed: "+err.Error(), 500)
+		log.Printf("❌ Gemini AI forecast failed after %v: %v", duration, err)
+		http.Error(w, "AI Forecast failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	log.Printf("✅ Gemini AI responded in %v", duration)
 
-	months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov"}
-
+	log.Println("Step 4: Preparing data for update...")
+	months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 	for i, row := range values {
-		if len(row) < 2 {
-			continue
-		}
-		product := fmt.Sprintf("%v", row[0])
+		if len(row) < 2 { continue }
 		remark := fmt.Sprintf("%v", row[1])
-
-		if len(row) <= colDec26 {
-			missing := colDec26 - len(row) + 1
-			for k := 0; k < missing; k++ {
-				row = append(row, "")
-			}
-			log.Printf("⚠️ Extended row %d (%s %s) by %d columns", i+54, product, remark, missing)
-		}
-
-		if product == "TOTAL" && remark == "COGS (K-EUR)" {
-			continue
-		}
-		if product == "TOTAL" && remark == "TOTAL DIN Yearly" {
-			if aiRow, ok := aiResult[remark]; ok {
-				for j, m := range months {
-					row[colJan26+j] = round2(aiRow[m])
-				}
-				values[i] = row
-			}
-			continue
-		}
+		if remark == "COGS (K-EUR)" { continue }
 
 		if aiRow, ok := aiResult[remark]; ok {
 			for j, m := range months {
-				row[colJan26+j] = round2(aiRow[m])
+				if colJan26+j < len(row) { row[colJan26+j] = round2(aiRow[m]) }
 			}
 			values[i] = row
 		}
 	}
 
 	updateRows := make([][]interface{}, 0, len(values))
-	for _, row := range values {
-		for len(row) <= colDec26 {
-			row = append(row, "")
-		}
-		chunk := row[colJan26 : colDec26+1]
-		updateRows = append(updateRows, chunk)
-	}
+	for _, row := range values { updateRows = append(updateRows, row[colJan26:colDec26+1]) }
 
-	writeRange := fmt.Sprintf("%s!AB54:AM62", req.SheetName)
-	_, err = srv.Spreadsheets.Values.Update(req.SpreadsheetID, writeRange,
-		&sheets.ValueRange{Values: updateRows}).ValueInputOption("RAW").Do()
+	log.Println("Step 5: Writing results back to Google Sheets...")
+	writeRange := fmt.Sprintf("%s!AB54:AM63", reqData.SheetName)
+	_, err = srv.Spreadsheets.Values.Update(reqData.SpreadsheetID, writeRange,
+		&sheets.ValueRange{Values: updateRows}).ValueInputOption("USER_ENTERED").Do()
 	if err != nil {
-		http.Error(w, "Failed write: "+err.Error(), 500)
+		http.Error(w, "Failed to write to sheet: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":          "✅ AI Forecast completed",
-		"cogs_total_2026": fmt.Sprintf("%.2f", cogs2026Total),
-		"din_dec_2026":    fmt.Sprintf("%.2f", dinDec2026),
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":          "✅ AI Forecast completed and updated successfully!",
+		"ai_call_duration": duration.String(),
 	})
 }
 
-// ======================= Health =======================
+// ======================= Server Setup =======================
+
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "✅ Forecast AI API up and running")
+	fmt.Fprintln(w, "✅ Forecast AI API is up and running")
 }
 
-// ======================= main =======================
 func main() {
 	http.HandleFunc("/forecast", forecastHandler)
 	http.HandleFunc("/", healthHandler)
 
 	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	if port == "" { port = "8080" }
+	log.Printf("🚀 AI Forecast Server starting on port %s...", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("❌ Server failed to start: %v", err)
 	}
-	log.Printf("🚀 AI Forecast Server running on port %s\n", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
