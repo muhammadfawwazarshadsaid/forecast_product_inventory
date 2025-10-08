@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"time" // Diimpor untuk timeout
+	"time"
 
 	"google.golang.org/api/option"
 	"google.golang.org/api/sheets/v4"
@@ -18,8 +18,6 @@ import (
 
 // ======================= Globals & Structs =======================
 
-// OPTIMASI: Definisikan HTTP client secara global dengan timeout.
-// Ini mencegah aplikasi "menggantung" jika API eksternal lambat.
 var apiClient = &http.Client{
 	Timeout: 30 * time.Second,
 }
@@ -48,7 +46,6 @@ func getSheetsService(ctx context.Context) (*sheets.Service, error) {
 	if credsJSON == "" {
 		return nil, fmt.Errorf("env variable GOOGLE_APPLICATION_CREDENTIALS_JSON not set")
 	}
-	// Menggunakan context dari handler untuk API call
 	return sheets.NewService(ctx, option.WithCredentialsJSON([]byte(credsJSON)))
 }
 
@@ -92,13 +89,13 @@ func mustJSON(v interface{}) string {
 // ======================= Gemini Forecast Function =======================
 
 func callGeminiForecast(
-	ctx context.Context, // Menerima context untuk timeout
+	ctx context.Context,
 	pastTotals map[string]map[string]float64,
 	lastYearProfile map[string][]float64,
 	cogs2026Total, dinDec2026 float64,
 ) (map[string]map[string]float64, error) {
 
-	models := []string{"gemini-1.5-flash-latest", "gemini-1.5-pro-latest"} // Flash dulu, lebih cepat
+	models := []string{"gemini-1.5-flash-latest", "gemini-1.5-pro-latest"}
 
 	prompt := fmt.Sprintf(`You are an efficient financial forecasting AI.
 
@@ -126,10 +123,10 @@ Task:
 
 	var lastErr error
 	for _, model := range models {
-		req, err := http.NewRequestWithContext(ctx, "POST",
-			fmt.Sprintf("[https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent](https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent)", model),
-			bytes.NewBuffer(body),
-		)
+		// BUG FIX: Variabel 'model' ditambahkan kembali sebagai argumen untuk fmt.Sprintf
+		url := fmt.Sprintf("[https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent](https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent)", model)
+		
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(body))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request for model %s: %w", model, err)
 		}
