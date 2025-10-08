@@ -88,6 +88,7 @@ func callGeminiForecast(
 ) (map[string]map[string]float64, error) {
 
 	models := []string{"gemini-2.5-pro", "gemini-2.5-flash"}
+
 	prompt := fmt.Sprintf(`You are a financial forecasting AI.
 
 Given:
@@ -109,9 +110,9 @@ Task:
   "WIP (K-EUR)": {...},
   "FG (K-EUR)": {...},
   "DEP (K-EUR)": {...},
-  "NIN TOTAL": {...},          // if present in input
-  "TOTAL NIN Spot": {...},     // if present in input
-  "TOTAL DIN Yearly": {...}    // Jan-Nov only; December is fixed externally
+  "NIN TOTAL": {...},          
+  "TOTAL NIN Spot": {...},     
+  "TOTAL DIN Yearly": {...}    
 }
 
 Yearly totals (K-EUR):
@@ -119,11 +120,11 @@ Yearly totals (K-EUR):
 
 2025 monthly share profile (12 numbers each remark, sum ≈ 1.0):
 %s
-`, cogs2026Total, dinDec2026)
+`, cogs2026Total, dinDec2026, mustJSON(pastTotals), mustJSON(lastYearProfile))
 
 	bodyReq := map[string]interface{}{
 		"contents": []map[string]interface{}{
-			{"role": "user", "parts": []map[string]string{{"text": prompt + "\n\n" + mustJSON(pastTotals) + "\n\n" + mustJSON(lastYearProfile)}}},
+			{"role": "user", "parts": []map[string]string{{"text": prompt}}},
 		},
 	}
 	body, _ := json.Marshal(bodyReq)
@@ -291,7 +292,6 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		product := fmt.Sprintf("%v", row[0])
 		remark := fmt.Sprintf("%v", row[1])
 
-		// 🧱 Pastikan panjang row cukup (hindari index out of range)
 		if len(row) <= colDec26 {
 			missing := colDec26 - len(row) + 1
 			for k := 0; k < missing; k++ {
