@@ -91,17 +91,35 @@ func callGeminiForecast(
 	prompt := fmt.Sprintf(`You are a financial forecasting AI.
 
 Given:
-1) Yearly totals (2024 & 2025).
-2) 2025 monthly share profile (sum ≈ 1.0).
-3) Known total COGS 2026 = %.2f
-4) Known TOTAL DIN Yearly Dec 2026 = %.2f
+1) Per-remark yearly totals for 2024 and 2025 (K-EUR).
+2) 2025 monthly share profile per remark (12 numbers summing ≈ 1.0).
+3) Known total COGS for 2026 (K-EUR) = %.2f.
+4) Known "TOTAL DIN Yearly" December 2026 (K-EUR) = %.2f (this cell must remain untouched; you only forecast Jan-Nov).
 
-Forecast Jan–Nov 2026 per remark.
-Return STRICT JSON only, format:
+Task:
+- Forecast Jan-Nov 2026 for each remark (K-EUR), following trend from 2024->2025 and 2025 monthly profile as prior for seasonality.
+- Keep values smooth and non-negative. Avoid unrealistic spikes.
+- Keep proportions versus COGS roughly consistent with past years (soft constraint).
+- Return STRICT JSON only (no Markdown fences).
+- JSON structure:
 {
   "GIN (K-EUR)": {"Jan": n, "Feb": n, ..., "Nov": n},
-  ...
-}`, cogs2026Total, dinDec2026)
+  "GIT (K-EUR)": {...},
+  "RM (K-EUR)": {...},
+  "WIP (K-EUR)": {...},
+  "FG (K-EUR)": {...},
+  "DEP (K-EUR)": {...},
+  "NIN TOTAL": {...},          // if present in input
+  "TOTAL NIN Spot": {...},     // if present in input
+  "TOTAL DIN Yearly": {...}    // Jan-Nov only; December is fixed externally
+}
+
+Yearly totals (K-EUR):
+%s
+
+2025 monthly share profile (12 numbers each remark, sum ≈ 1.0):
+%s
+`, cogs2026Total, dinDec2026)
 
 	bodyReq := map[string]interface{}{
 		"contents": []map[string]interface{}{
