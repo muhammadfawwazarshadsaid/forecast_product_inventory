@@ -70,22 +70,17 @@ func round2(x float64) float64 {
 
 // -------- Gemini call --------
 func callGeminiForecast(pastTotals map[string]map[string]float64, lastYearProfile map[string][]float64, cogs2026Total, dinDec2026 float64) (map[string]map[string]float64, error) {
-	// bentuk prompt: berikan total per tahun (2024, 2025) + profil bulanan 2025 per remark
-	// minta output Jan–Nov 2026 per remark dalam JSON bersih.
-	payloadObj := map[string]interface{}{
-		"role": "user",
-		"parts": []map[string]string{{
-			"text": fmt.Sprintf(
-				`You are a financial forecasting AI.
+	// prompt
+	prompt := fmt.Sprintf(`You are a financial forecasting AI.
 
 Given:
 1) Per-remark yearly totals for 2024 and 2025 (K-EUR).
 2) 2025 monthly share profile per remark (12 numbers summing ~1.0).
 3) Known total COGS for 2026 (K-EUR) = %.2f.
-4) Known "TOTAL DIN Yearly" December 2026 (K-EUR) = %.2f (this cell must remain untouched; you only forecast Jan–Nov).
+4) Known "TOTAL DIN Yearly" December 2026 (K-EUR) = %.2f (this cell must remain untouched; you only forecast Jan-Nov).
 
 Task:
-- Forecast Jan–Nov 2026 for each remark (K-EUR), following trend from 2024->2025 and 2025 monthly profile as prior for seasonality.
+- Forecast Jan-Nov 2026 for each remark (K-EUR), following trend from 2024->2025 and 2025 monthly profile as prior for seasonality.
 - Keep values smooth and non-negative. Avoid unrealistic spikes.
 - Keep proportions versus COGS roughly consistent with past years (soft constraint).
 - Return STRICT JSON only. Do not include any text outside JSON.
@@ -99,7 +94,7 @@ Task:
   "DEP (K-EUR)": {...},
   "NIN TOTAL": {...},          // if present in input
   "TOTAL NIN Spot": {...},     // if present in input
-  "TOTAL DIN Yearly": {...}    // Jan–Nov only; December is fixed externally
+  "TOTAL DIN Yearly": {...}    // Jan-Nov only; December is fixed externally
 }
 
 Yearly totals (K-EUR):
@@ -107,48 +102,63 @@ Yearly totals (K-EUR):
 
 2025 monthly share profile (12 numbers each remark, sum ≈ 1.0):
 %v
-`, cogs2026Total, dinDec2026,
-				mustJSON(pastTotals),
-				mustJSON(lastYearProfile),
-			),
-		}},
+`, cogs2026Total, dinDec2026, mustJSON(pastTotals), mustJSON(lastYearProfile))
+
+	payload := map[string]interface{}{
+		"contents": []map[string]interface{}{
+			{"role": "user", "parts": []map[string]string{{"text": prompt}}},
+		},
+	}
+	body, _ := json.Marshal(payload)
+
+	// Try Pro first, then fallback to Flash
+	models := []string{"gemini-2.5-pro", "gemini-2.5-flash"}
+	var lastErr error
+
+	for _, model := range models {
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", model)
+		req, _ := http.NewRequest("POST", url, bytes.NewBuffer(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-goog-api-key", os.Getenv("GEMINI_API_KEY"))
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("%s request error: %v", model, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("%s API returned %d", model, resp.StatusCode)
+			log.Printf("⚠️ %s failed (%d), trying fallback...\n", model, resp.StatusCode)
+			continue
+		}
+
+		var result GeminiResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			lastErr = fmt.Errorf("%s decode failed: %v", model, err)
+			continue
+		}
+		if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
+			lastErr = fmt.Errorf("%s no candidates", model)
+			continue
+		}
+
+		text := result.Candidates[0].Content.Parts[0].Text
+		text = stripFence(text)
+
+		out := map[string]map[string]float64{}
+		if err := json.Unmarshal([]byte(text), &out); err != nil {
+			log.Println("⚠️ Gemini raw output:", text)
+			lastErr = fmt.Errorf("%s output invalid JSON: %v", model, err)
+			continue
+		}
+
+		log.Printf("✅ Forecast generated with %s\n", model)
+		return out, nil
 	}
 
-	bodyReq := map[string]interface{}{
-		"contents": []map[string]interface{}{payloadObj},
-	}
-	body, _ := json.Marshal(bodyReq)
-
-	req, _ := http.NewRequest("POST",
-		"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
-		bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", os.Getenv("GEMINI_API_KEY"))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("Gemini request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	var result GeminiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("Gemini decode failed: %v", err)
-	}
-	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("no candidates from Gemini")
-	}
-
-	text := result.Candidates[0].Content.Parts[0].Text
-	// kadang Gemini mengembalikan ```json ... ``` -> bersihkan ringan
-	text = stripFence(text)
-
-	out := map[string]map[string]float64{}
-	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		log.Println("⚠️ Gemini raw:", text)
-		return nil, fmt.Errorf("Gemini output not valid JSON: %v", err)
-	}
-	return out, nil
+	return nil, fmt.Errorf("all Gemini calls failed: %v", lastErr)
 }
 
 func stripFence(s string) string {
@@ -271,7 +281,7 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 
 		// anchors:
 		if product == "TOTAL" && remark == "COGS (K-EUR)" && req.KnownCOGSTotal2026 == nil {
-			// kalau 2026 COGS total sudah diisi di sheet, kita sum AB–AM.
+			// kalau 2026 COGS total sudah diisi di sheet, kita sum AB-AM.
 			sum26 := 0.0
 			for c := colJan26; c <= colDec26; c++ {
 				sum26 += atof(row[c])
@@ -298,7 +308,7 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// tulis balik Jan–Nov (AB–AL). AM (Des) tetap.
+	// tulis balik Jan-Nov (AB-AL). AM (Des) tetap.
 	months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov"}
 
 	for i, row := range values {
@@ -312,7 +322,7 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		if product == "TOTAL" && remark == "COGS (K-EUR)" {
 			continue
 		}
-		// TOTAL DIN Yearly: kita isi Jan–Nov dari AI, Desember biarin
+		// TOTAL DIN Yearly: kita isi Jan-Nov dari AI, Desember biarin
 		if product == "TOTAL" && remark == "TOTAL DIN Yearly" {
 			if aiRow, ok := aiResult[remark]; ok {
 				for j, m := range months {
@@ -332,7 +342,7 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// siapkan payload update: hanya kolom AB–AM
+	// siapkan payload update: hanya kolom AB-AM
 	updateRows := make([][]interface{}, 0, len(values))
 	for _, row := range values {
 		// pastikan panjang
