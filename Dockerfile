@@ -1,9 +1,9 @@
 # ========== Build Stage ==========
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
-COPY go.mod ./
-RUN go mod tidy
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
 
 # build binary
@@ -15,6 +15,5 @@ FROM alpine:latest
 WORKDIR /root/
 COPY --from=builder /app/forecast .
 
-# use environment variable PORT (Render injects this automatically)
 EXPOSE 8080
 CMD ["./forecast"]
