@@ -1,9 +1,8 @@
 services:
   - type: web
-    name: forecast
-    env: go
-    buildCommand: go mod tidy
-    startCommand: ./forecast
+    name: forecast-go
+    env: docker
+    plan: free
     envVars:
       - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
         sync: false
