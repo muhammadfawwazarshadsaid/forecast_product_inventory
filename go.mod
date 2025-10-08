@@ -2,7 +2,10 @@ module forecast
 
 go 1.24.0
 
-require google.golang.org/api v0.252.0
+require (
+	github.com/lib/pq v1.10.9
+	google.golang.org/api v0.252.0
+)
 
 require (
 	cloud.google.com/go/auth v0.17.0 // indirect
