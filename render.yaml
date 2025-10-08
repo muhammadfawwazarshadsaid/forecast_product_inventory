@@ -1,10 +1,9 @@
 services:
   - type: web
-    name: forecast-service
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    name: forecast
+    env: go
+    buildCommand: go mod tidy
+    startCommand: ./forecast
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.9.18
-    plan: free
+      - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
+        sync: false
