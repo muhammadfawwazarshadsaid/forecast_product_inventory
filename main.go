@@ -15,11 +15,13 @@ import (
 	"google.golang.org/api/sheets/v4"
 )
 
+// ======================= Request/Response Types =======================
+
 type ForecastRequest struct {
-	SpreadsheetID     string   `json:"spreadsheetId"`
-	SheetName         string   `json:"sheetName"`
-	KnownCOGSTotal2026 *float64 `json:"knownCogsTotal2026,omitempty"`   // opsional; kalau kosong coba baca dari sheet
-	KnownDINDec2026    *float64 `json:"knownDinDec2026,omitempty"`      // opsional; kalau kosong baca dari row "TOTAL DIN Yearly" kolom AM
+	SpreadsheetID      string   `json:"spreadsheetId"`
+	SheetName          string   `json:"sheetName"`
+	KnownCOGSTotal2026 *float64 `json:"knownCogsTotal2026,omitempty"` // optional; override
+	KnownDINDec2026    *float64 `json:"knownDinDec2026,omitempty"`     // optional; override
 }
 
 type GeminiResponse struct {
@@ -31,6 +33,8 @@ type GeminiResponse struct {
 		} `json:"content"`
 	} `json:"candidates"`
 }
+
+// ======================= Utilities =======================
 
 func getSheetsService() (*sheets.Service, error) {
 	credsJSON := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -56,26 +60,54 @@ func atof(v interface{}) float64 {
 	}
 }
 
-func sum(vals []float64) float64 {
-	s := 0.0
-	for _, x := range vals {
-		s += x
-	}
-	return s
-}
-
 func round2(x float64) float64 {
 	return math.Round(x*100) / 100
 }
 
-// -------- Gemini call --------
-func callGeminiForecast(pastTotals map[string]map[string]float64, lastYearProfile map[string][]float64, cogs2026Total, dinDec2026 float64) (map[string]map[string]float64, error) {
-	// prompt
+func stripFence(s string) string {
+	// remove ```json ... ``` fences if any
+	if len(s) >= 7 && s[:7] == "```json" {
+		s = s[7:]
+	}
+	if len(s) >= 3 && s[:3] == "```" {
+		s = s[3:]
+	}
+	if n := len(s); n >= 3 && s[n-3:] == "```" {
+		s = s[:n-3]
+	}
+	return s
+}
+
+func mustJSON(v interface{}) string {
+	b, _ := json.MarshalIndent(v, "", "  ")
+	return string(b)
+}
+
+// ======================= Gemini Forecast (Pro -> Flash fallback) =======================
+
+func callGeminiForecast(
+	pastTotals map[string]map[string]float64,
+	lastYearProfile map[string][]float64,
+	cogs2026Total, dinDec2026 float64,
+) (map[string]map[string]float64, error) {
+
+	// Optional: allow env override (default try Pro -> fallback Flash)
+	modelEnv := os.Getenv("GEMINI_MODEL") // e.g., "gemini-2.5-pro" or "gemini-2.5-flash"
+	models := []string{"gemini-2.5-pro", "gemini-2.5-flash"}
+	if modelEnv != "" {
+		// still try a second model as a fallback if user set Pro explicitly
+		if modelEnv == "gemini-2.5-pro" {
+			models = []string{"gemini-2.5-pro", "gemini-2.5-flash"}
+		} else {
+			models = []string{modelEnv, "gemini-2.5-flash"}
+		}
+	}
+
 	prompt := fmt.Sprintf(`You are a financial forecasting AI.
 
 Given:
 1) Per-remark yearly totals for 2024 and 2025 (K-EUR).
-2) 2025 monthly share profile per remark (12 numbers summing ~1.0).
+2) 2025 monthly share profile per remark (12 numbers summing ≈ 1.0).
 3) Known total COGS for 2026 (K-EUR) = %.2f.
 4) Known "TOTAL DIN Yearly" December 2026 (K-EUR) = %.2f (this cell must remain untouched; you only forecast Jan-Nov).
 
@@ -83,7 +115,7 @@ Task:
 - Forecast Jan-Nov 2026 for each remark (K-EUR), following trend from 2024->2025 and 2025 monthly profile as prior for seasonality.
 - Keep values smooth and non-negative. Avoid unrealistic spikes.
 - Keep proportions versus COGS roughly consistent with past years (soft constraint).
-- Return STRICT JSON only. Do not include any text outside JSON.
+- Return STRICT JSON only (no Markdown fences).
 - JSON structure:
 {
   "GIN (K-EUR)": {"Jan": n, "Feb": n, ..., "Nov": n},
@@ -98,10 +130,10 @@ Task:
 }
 
 Yearly totals (K-EUR):
-%v
+%s
 
 2025 monthly share profile (12 numbers each remark, sum ≈ 1.0):
-%v
+%s
 `, cogs2026Total, dinDec2026, mustJSON(pastTotals), mustJSON(lastYearProfile))
 
 	payload := map[string]interface{}{
@@ -111,8 +143,6 @@ Yearly totals (K-EUR):
 	}
 	body, _ := json.Marshal(payload)
 
-	// Try Pro first, then fallback to Flash
-	models := []string{"gemini-2.5-pro", "gemini-2.5-flash"}
 	var lastErr error
 
 	for _, model := range models {
@@ -144,8 +174,7 @@ Yearly totals (K-EUR):
 			continue
 		}
 
-		text := result.Candidates[0].Content.Parts[0].Text
-		text = stripFence(text)
+		text := stripFence(result.Candidates[0].Content.Parts[0].Text)
 
 		out := map[string]map[string]float64{}
 		if err := json.Unmarshal([]byte(text), &out); err != nil {
@@ -161,25 +190,8 @@ Yearly totals (K-EUR):
 	return nil, fmt.Errorf("all Gemini calls failed: %v", lastErr)
 }
 
-func stripFence(s string) string {
-	if len(s) >= 7 && s[:7] == "```json" {
-		s = s[7:]
-	}
-	if len(s) >= 3 && s[:3] == "```" {
-		s = s[3:]
-	}
-	if n := len(s); n >= 3 && s[n-3:] == "```" {
-		s = s[:n-3]
-	}
-	return s
-}
+// ======================= /forecast Handler =======================
 
-func mustJSON(v interface{}) string {
-	b, _ := json.MarshalIndent(v, "", "  ")
-	return string(b)
-}
-
-// -------- HTTP Handlers --------
 func forecastHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
@@ -197,12 +209,14 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Sheets
 	srv, err := getSheetsService()
 	if err != nil {
 		http.Error(w, "Failed Sheets API: "+err.Error(), 500)
 		return
 	}
 
+	// Baca range data target (sesuai layout lo)
 	readRange := fmt.Sprintf("%s!B54:AM62", req.SheetName)
 	resp, err := srv.Spreadsheets.Values.Get(req.SpreadsheetID, readRange).Do()
 	if err != nil {
@@ -215,24 +229,23 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// index helper (relatif ke kolom B sebagai index 0)
+	// Indeks (relatif ke kolom B sebagai index 0)
 	const (
-		colJan26 = 26 // AB
-		colNov26 = 36 // AL
-		colDec26 = 37 // AM
-		colStart24 = 2   // Jan-24
-		colEnd24   = 13  // Dec-24
-		colStart25 = 14  // Jan-25
-		colEnd25   = 25  // Dec-25
+		colJan26   = 26 // AB
+		colNov26   = 36 // AL
+		colDec26   = 37 // AM
+		colStart24 = 2  // Jan-24
+		colEnd24   = 13 // Dec-24
+		colStart25 = 14 // Jan-25
+		colEnd25   = 25 // Dec-25
 	)
 
-	// siapkan struktur RAG: total 2024, total 2025, dan profil bulanan 2025 per remark
-	pastTotals := map[string]map[string]float64{}     // remark -> {"2024": x, "2025": y}
-	lastYearProfile := map[string][]float64{}         // remark -> 12 shares for 2025
-	var cogs2026Total float64                         // target total COGS 2026
-	var dinDec2026 float64                            // target DIN Yearly Des 2026
+	// Siapkan data historis + profil 2025
+	pastTotals := map[string]map[string]float64{} // remark -> {"2024": x, "2025": y}
+	lastYearProfile := map[string][]float64{}     // remark -> 12 share (2025)
+	var cogs2026Total float64                     // anchor total COGS 2026
+	var dinDec2026 float64                        // anchor DIN Yearly Dec 2026
 
-	// scan baris untuk dapatin angka & anchors
 	for _, row := range values {
 		if len(row) < 2 {
 			continue
@@ -240,48 +253,42 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		product := fmt.Sprintf("%v", row[0])
 		remark := fmt.Sprintf("%v", row[1])
 
-		// pastikan row panjang
 		for len(row) <= colDec26 {
 			row = append(row, "")
 		}
 
-		// hitung total 2024/2025 untuk remark ini
-		var y2024, y2025 float64
-		var prof25 []float64
+		// sum 2024/2025
+		var y2024 float64
+		tmp25 := make([]float64, 12)
+		sum25 := 0.0
+
+		for c := colStart24; c <= colEnd24; c++ {
+			y2024 += atof(row[c])
+		}
+		for i, c := 0, colStart25; c <= colEnd25; i, c = i+1, c+1 {
+			v := atof(row[c])
+			tmp25[i] = v
+			sum25 += v
+		}
+
+		prof25 := make([]float64, 12)
+		if sum25 > 0 {
+			for i := 0; i < 12; i++ {
+				prof25[i] = tmp25[i] / sum25
+			}
+		} else {
+			for i := 0; i < 12; i++ {
+				prof25[i] = 1.0 / 12.0
+			}
+		}
 
 		if remark != "" {
-			// sum 2024
-			for c := colStart24; c <= colEnd24; c++ {
-				y2024 += atof(row[c])
-			}
-			// sum 2025 dan kumpulkan profil bulanan 2025
-			sum25 := 0.0
-			tmp25 := make([]float64, 12)
-			for i, c := 0, colStart25; c <= colEnd25; i, c = i+1, c+1 {
-				v := atof(row[c])
-				tmp25[i] = v
-				sum25 += v
-			}
-			if sum25 > 0 {
-				prof25 = make([]float64, 12)
-				for i := 0; i < 12; i++ {
-					prof25[i] = tmp25[i] / sum25
-				}
-			} else {
-				// fallback: flat
-				prof25 = make([]float64, 12)
-				for i := range prof25 {
-					prof25[i] = 1.0 / 12.0
-				}
-			}
-
 			pastTotals[remark] = map[string]float64{"2024": round2(y2024), "2025": round2(sum25)}
 			lastYearProfile[remark] = prof25
 		}
 
-		// anchors:
+		// anchors
 		if product == "TOTAL" && remark == "COGS (K-EUR)" && req.KnownCOGSTotal2026 == nil {
-			// kalau 2026 COGS total sudah diisi di sheet, kita sum AB-AM.
 			sum26 := 0.0
 			for c := colJan26; c <= colDec26; c++ {
 				sum26 += atof(row[c])
@@ -293,7 +300,7 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// override kalau user kirim anchor via request
+	// override anchors kalau dikirim via request
 	if req.KnownCOGSTotal2026 != nil {
 		cogs2026Total = *req.KnownCOGSTotal2026
 	}
@@ -301,16 +308,26 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		dinDec2026 = *req.KnownDINDec2026
 	}
 
-	// panggil Gemini
+	// (Opsional) RAG retrieval dari vector DB untuk konteks tambahan
+	if db, err := getDB(); err == nil {
+		if similar, err := searchSimilarRemarks(db, "COGS & DIN trend 2024 2025 finance forecast", 5); err == nil {
+			log.Printf("🔍 VectorDB similar remarks: %d\n", len(similar))
+			_ = similar // bisa di-inject ke prompt kalau mau (lihat vectorstore.go)
+		}
+	} else {
+		log.Println("Skip vector DB (no DATABASE_URL)")
+	}
+
+	// Panggil Gemini (Pro → fallback Flash)
 	aiResult, err := callGeminiForecast(pastTotals, lastYearProfile, cogs2026Total, dinDec2026)
 	if err != nil {
 		http.Error(w, "AI Forecast failed: "+err.Error(), 500)
 		return
 	}
 
-	// tulis balik Jan-Nov (AB-AL). AM (Des) tetap.
 	months := []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov"}
 
+	// Tulis balik Jan-Nov (AB-AL); Des (AM) tetap
 	for i, row := range values {
 		if len(row) < 2 {
 			continue
@@ -318,11 +335,9 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		product := fmt.Sprintf("%v", row[0])
 		remark := fmt.Sprintf("%v", row[1])
 
-		// skip TOTAL COGS (anchor) — jangan disentuh
 		if product == "TOTAL" && remark == "COGS (K-EUR)" {
-			continue
+			continue // anchor
 		}
-		// TOTAL DIN Yearly: kita isi Jan-Nov dari AI, Desember biarin
 		if product == "TOTAL" && remark == "TOTAL DIN Yearly" {
 			if aiRow, ok := aiResult[remark]; ok {
 				for j, m := range months {
@@ -333,7 +348,6 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// general case: kalau AI ada, tulis
 		if aiRow, ok := aiResult[remark]; ok {
 			for j, m := range months {
 				row[colJan26+j] = round2(aiRow[m])
@@ -342,14 +356,12 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// siapkan payload update: hanya kolom AB-AM
+	// Update balik (AB:AM)
 	updateRows := make([][]interface{}, 0, len(values))
 	for _, row := range values {
-		// pastikan panjang
 		for len(row) <= colDec26 {
 			row = append(row, "")
 		}
-		// slice AB..AM
 		chunk := make([]interface{}, 0, (colDec26-colJan26)+1)
 		for c := colJan26; c <= colDec26; c++ {
 			chunk = append(chunk, row[c])
@@ -367,18 +379,23 @@ func forecastHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"status":           "✅ AI Forecast completed",
-		"cogs_total_2026":  fmt.Sprintf("%.2f", cogs2026Total),
-		"din_dec_2026":     fmt.Sprintf("%.2f", dinDec2026),
+		"status":          "✅ AI Forecast completed",
+		"cogs_total_2026": fmt.Sprintf("%.2f", cogs2026Total),
+		"din_dec_2026":    fmt.Sprintf("%.2f", dinDec2026),
 	})
 }
+
+// ======================= Health =======================
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "✅ Forecast AI API up and running")
 }
 
+// ======================= main =======================
+
 func main() {
 	http.HandleFunc("/forecast", forecastHandler)
+	http.HandleFunc("/train-embeddings", trainEmbeddingsHandler) // from trainer.go
 	http.HandleFunc("/", healthHandler)
 
 	port := os.Getenv("PORT")
