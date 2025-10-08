@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: forecast-service
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.18
+    plan: free
