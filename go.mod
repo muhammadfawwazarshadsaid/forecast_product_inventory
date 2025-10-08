@@ -1,6 +1,6 @@
 module forecast
 
-go 1.25.1
+go 1.22
 
 require (
 	cloud.google.com/go/auth v0.17.0 // indirect
